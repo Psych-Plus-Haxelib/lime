@@ -43,6 +43,9 @@ class NativeAudioSource
 	private var stream:Bool;
 	private var streamTimer:Timer;
 	private var stretchHandle:CFFIPointer;
+	private var decodeBuffer:UInt8Array;
+	private var stretchBuffer:UInt8Array;
+	private var uploadLength:Int = 0;
 	private var stretchRemainder:Float = 0;
 	private var tempo:Float = 1;
 	private var timer:Timer;
@@ -72,6 +75,8 @@ class NativeAudioSource
 			handle = null;
 		}
 		stretchHandle = null;
+		decodeBuffer = null;
+		stretchBuffer = null;
 	}
 
 	public function init():Void
@@ -119,10 +124,7 @@ class NativeAudioSource
 			}
 
 			handle = AL.createSource();
-			#if (cpp && !cppia)
-			if (parent.buffer.bitsPerSample == 16)
-				stretchHandle = NativeCFFI.lime_audio_stretch_create(parent.buffer.channels, parent.buffer.sampleRate);
-			#end
+			// Normal-speed playback does not need a Signalsmith processor.
 		}
 		else
 		{
@@ -188,7 +190,9 @@ class NativeAudioSource
 
 		if (stream)
 		{
-			setCurrentTime(getCurrentTime());
+			var time = completed ? 0 : getCurrentTime();
+			completed = false;
+			setCurrentTime(time);
 
 			streamTimer = new Timer(STREAM_TIMER_FREQUENCY);
 			streamTimer.run = streamTimer_onRun;
@@ -222,7 +226,9 @@ class NativeAudioSource
 	private function readVorbisFileBuffer(vorbisFile:VorbisFile, length:Int):UInt8Array
 	{
 		#if lime_vorbis
-		var buffer = new UInt8Array(length);
+		if (decodeBuffer == null || decodeBuffer.length < length)
+			decodeBuffer = new UInt8Array(Std.int(Math.max(STREAM_BUFFER_SIZE, length)));
+		var buffer = decodeBuffer;
 		var read = 0, total = 0, readMax;
 
 		for (i in 0...STREAM_NUM_BUFFERS-1)
@@ -252,6 +258,9 @@ class NativeAudioSource
 			}
 		}
 
+		uploadLength = total;
+		// A reused input buffer must not feed samples from an earlier block at EOF.
+		for (i in total...length) buffer[i] = 0;
 		return buffer;
 		#else
 		return null;
@@ -269,10 +278,19 @@ class NativeAudioSource
 			var inputFrames = Std.int(exactInputFrames);
 			stretchRemainder = exactInputFrames - inputFrames;
 			var input = readVorbisFileBuffer(vorbisFile, inputFrames * bytesPerFrame);
-			var output = new UInt8Array(outputFrames * bytesPerFrame);
+			var required = outputFrames * bytesPerFrame;
+			if (stretchBuffer == null || stretchBuffer.length < required)
+				stretchBuffer = new UInt8Array(Std.int(Math.max(STREAM_BUFFER_SIZE, required)));
+			var output = stretchBuffer;
 
 			if (NativeCFFI.lime_audio_stretch_process(stretchHandle, input.buffer, output.buffer, inputFrames, outputFrames))
+			{
+				uploadLength = required;
 				return output;
+			}
+			// The decoder already advanced. Do not read and discard another block on failure.
+			tempo = 1;
+			return input;
 		}
 		#end
 		return readVorbisFileBuffer(vorbisFile, outputLength);
@@ -340,7 +358,9 @@ class NativeAudioSource
 					outputLength = Std.int(Math.min(STREAM_BUFFER_SIZE / bytesPerFrame, Math.max(1, Math.floor(remainingFrames / tempo)))) * bytesPerFrame;
 				}
 				data = readStretchedVorbisFileBuffer(vorbisFile, outputLength);
-				AL.bufferData(buffer, format, data, data.length, parent.buffer.sampleRate);
+				if (uploadLength <= 0) break;
+				// OpenAL copies these bytes synchronously; reuse the scratch storage for the next buffer.
+				AL.bufferData(buffer, format, data, uploadLength, parent.buffer.sampleRate);
 				numBuffers++;
 			}
 
@@ -377,7 +397,9 @@ class NativeAudioSource
 			timer.stop();
 		}
 
-		setCurrentTime(0);
+		// Stopping/disposal must not decode and upload another three blocks of audio.
+		setCurrentTime(0, false);
+		completed = false;
 	}
 
 	// Event Handlers
@@ -437,7 +459,7 @@ class NativeAudioSource
 		return 0;
 	}
 
-	public function setCurrentTime(value:Int):Int
+	public function setCurrentTime(value:Int, prime:Bool = true):Int
 	{
 		// `setCurrentTime()` has side effects and is never safe to skip.
 		/* if (value == getCurrentTime())
@@ -459,8 +481,12 @@ class NativeAudioSource
 					stretchRemainder = 0;
 
 					parent.buffer.__srcVorbisFile.timeSeek((value + parent.offset) / 1000);
-					AL.sourceUnqueueBuffers(handle, STREAM_NUM_BUFFERS);
-					refillBuffersUnlocked(buffers);
+					var queued = AL.getSourcei(handle, AL.BUFFERS_QUEUED);
+					if (queued > 0) AL.sourceUnqueueBuffers(handle, queued);
+					if (prime)
+						refillBuffersUnlocked(buffers);
+					else
+						for (i in 0...bufferTimeBlocks.length) bufferTimeBlocks[i] = (value + parent.offset) / 1000;
 
 					if (playing) AL.sourcePlay(handle);
 				}
@@ -550,7 +576,11 @@ class NativeAudioSource
 
 		var current = getCurrentTime();
 		tempo = value;
-		if (stream && handle != null) setCurrentTime(current);
+		#if (cpp && !cppia)
+		if (stream && tempo != 1 && stretchHandle == null && parent.buffer.bitsPerSample == 16)
+			stretchHandle = NativeCFFI.lime_audio_stretch_create(parent.buffer.channels, parent.buffer.sampleRate);
+		#end
+		if (stream && handle != null) setCurrentTime(current, playing);
 		return tempo;
 	}
 
