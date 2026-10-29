@@ -33,7 +33,11 @@ class AssetsMacro
 
 		var superCall = Context.defined("html5") ? macro super(bytes.b.buffer)
 			: Context.defined("hl") ? macro super(bytes.b, bytes.length)
+			#if (haxe_ver >= 5)
+			: macro super(bytes.length);
+			#else
 			: macro super(bytes.length, bytes.b);
+			#end
 
 		var definition = macro class Temp
 		{
